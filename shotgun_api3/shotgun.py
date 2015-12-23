@@ -47,6 +47,8 @@ import urllib
 import urllib2      # used for image upload
 import urlparse
 import shutil       # used for attachment download
+import requests
+from requests_toolbelt.multipart.encoder import MultipartEncoder
 
 # use relative import for versions >=2.5 and package import for python versions <2.5
 if (sys.version_info[0] > 2) or (sys.version_info[0] == 2 and sys.version_info[1] >= 6):
@@ -65,6 +67,8 @@ LOG.setLevel(logging.WARN)
 
 
 SG_TIMEZONE = SgTimezone()
+
+MAX_UPLOAD_FILE_SIZE = 2147483648
 
 
 try:
@@ -87,6 +91,10 @@ class ShotgunError(Exception):
 
 class ShotgunFileDownloadError(ShotgunError):
     """Exception for file download-related errors"""
+    pass
+
+class ShotgunFileUploadError(ShotgunError):
+    """Exception for file upload-related errors"""
     pass
 
 class Fault(ShotgunError):
@@ -1454,8 +1462,8 @@ class Shotgun(object):
         is_thumbnail = (field_name == "thumb_image" or field_name == "filmstrip_thumb_image")
 
         params = {
-            "entity_type" : entity_type,
-            "entity_id" : entity_id,
+            "entity_type": entity_type,
+            "entity_id": str(entity_id),
         }
 
         params.update(self._auth_params())
@@ -1463,7 +1471,7 @@ class Shotgun(object):
         if is_thumbnail:
             url = urlparse.urlunparse((self.config.scheme, self.config.server,
                 "/upload/publish_thumbnail", None, None, None))
-            params["thumb_image"] = open(path, "rb")
+            params["thumb_image"] = _get_requests_file_struct(path)
             if field_name == "filmstrip_thumb_image":
                 params["filmstrip"] = True
 
@@ -1480,28 +1488,32 @@ class Shotgun(object):
             if tag_list:
                 params["tag_list"] = tag_list
 
-            params["file"] = open(path, "rb")
-
-        # Create opener with extended form post support
-        opener = self._build_opener(FormPostHandler)
+            params["file"] = _get_requests_file_struct(path)
 
         # Perform the request
-        try:
-            result = opener.open(url, params).read()
-        except urllib2.HTTPError, e:
-            if e.code == 500:
-                raise ShotgunError("Server encountered an internal error. "
-                    "\n%s\n(%s)\n%s\n\n" % (url, self._sanitize_auth_params(params), e))
-            else:
-                raise ShotgunError("Unanticipated error occurred uploading "
-                    "%s: %s" % (path, e))
-        else:
-            if not str(result).startswith("1"):
-                raise ShotgunError("Could not upload file successfully, but "\
-                    "not sure why.\nPath: %s\nUrl: %s\nError: %s" % (
-                    path, url, str(result)))
+        m = MultipartEncoder(fields=params)
+        result = requests.post(url, data=m, headers={'Content-Type': m.content_type})
 
-        attachment_id = int(str(result).split(":")[1].split("\n")[0])
+        if result.status_code == 500:
+            raise ShotgunError(
+                "Server encountered an internal error. \n%s\n(%s)\n%s\n\n" % (
+                    url, self._sanitize_auth_params(params), e
+                )
+            )
+        elif result.status_code != 200:
+            raise ShotgunError(
+                "Unanticipated error occurred uploading %s: %s" % (
+                    path, result.content
+                )
+            )
+        elif not result.content.startswith("1"):
+            raise ShotgunError(
+                "Could not upload file successfully, but not sure why.\nPath: %s\nUrl: %s\nError: %s" % (
+                    path, url, str(result.content)
+                )
+            )
+
+        attachment_id = int(result.content.split(':')[1].split("\n")[0])
         return attachment_id
 
     def download_attachment(self, attachment=False, file_path=None, 
@@ -2634,3 +2646,15 @@ def _version_str(version):
     """Converts a tuple of int's to a '.' separated str"""
     return '.'.join(map(str, version))
     
+def _get_requests_file_struct(path):
+    """
+    Given a path, return a requests compatible struct
+
+    This will raise a ShotgunFileUploadError if the file is too large.
+    """
+    if os.path.getsize(path) >= MAX_UPLOAD_FILE_SIZE:
+        error = "File exceeds max file size (%d): %s"
+        raise ShotgunFileUploadError(error % (MAX_UPLOAD_FILE_SIZE, path))
+    fh = open(path, "rb")
+    filename = os.path.basename(path)
+    return (filename, fh, mimetypes.guess_type(filename)[0])
